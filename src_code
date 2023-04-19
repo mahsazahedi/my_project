@@ -15,37 +15,18 @@ from torch.nn.modules.module import Module
 from torch.nn import Parameter
 import argparse
 from torch.cuda import amp
+#import torch.cuda.profiler as profiler
+#import torch.cuda.nvtx as nvtx
+#import pyprof
+#pyprof.init()
 import subprocess
-from torch.autograd import Variable
-import argparse
-import shutil
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
-import torch.utils.data
-import torch.utils.data.distributed
-import torchvision.datasets as datasets
+#import nvsmi
+import torch
+from torch import nn
 from torch import Tensor
-
-import pycuda.autoinit
-from pycuda import driver, compiler, gpuarray, tools
-
-import pycuda.gpuarray as gpuarray
-#import skcuda.cublas as cublas
-
+from torch.autograd import Variable
 torch.backends.cudnn.deterministic = True
-
-def set_device():
-    if torch.cuda.is_available():
-        dev = "cuda"
-    else:
-        dev = 'cpu'
-    return torch.device(dev)
-
-device = set_device()
-device
-
-#@title
+#@title Default title text
 print('==> Preparing data..')
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
@@ -67,7 +48,6 @@ test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
-
 def show_transformed_images(dataset):
      loader = torch.utils.data.DataLoader(dataset, batch_size=6, shuffle=True)
      batch = next(iter(loader))
@@ -79,70 +59,48 @@ def show_transformed_images(dataset):
      print('labels: ', labels)
 show_transformed_images(train_dataset)
 
-def prune_model(model):
-    parameters_to_prune = (
-     (model.conv1, 'weight'),
-     (model.layer1[0].conv1, 'weight'),
-     (model.layer1[0].conv2, 'weight'),
-     (model.layer1[1].conv1, 'weight'),
-     (model.layer1[1].conv2, 'weight'),
-     (model.layer2[0].conv1, 'weight'),
-     (model.layer2[0].conv2, 'weight'),
-     (model.layer2[1].conv1, 'weight'),
-     (model.layer2[1].conv2, 'weight'),
-     (model.layer3[0].conv1, 'weight'),
-     (model.layer3[0].conv2, 'weight'),
-     (model.layer3[1].conv1, 'weight'),
-     (model.layer3[1].conv2, 'weight'),
-     (model.layer4[0].conv1, 'weight'),
-     (model.layer4[0].conv2, 'weight'),
-     (model.layer4[1].conv1, 'weight'),
-     (model.layer4[1].conv2, 'weight'),
-    # (model.fc, 'weight'),
-     )
-    print("pruning model for layer {name} : ")
-    prune.global_unstructured(
-                 parameters_to_prune,
-                 pruning_method=prune.L1Unstructured,
-                 amount=0.3
-             )
-    for module, _ in parameters_to_prune:
+def set_device():
+    if torch.cuda.is_available():
+        dev = "cuda"
+    else:
+        dev = 'cpu'
+    return torch.device(dev)
+
+device = set_device()
+device
+import torch.nn.utils.prune as prune
+
+def prune_model(model, pruning_method=prune.L1Unstructured, amount=0.3):
+
+    parameters_to_prune = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.Conv2d):
+            parameters_to_prune.append((module, 'weight'))
+
+    for module, parameter_name in parameters_to_prune:
+        prune.global_unstructured(
+             parameters_to_prune,
+             pruning_method=prune.L1Unstructured,
+             amount=0.3,
+            )
+        # Convert pruned weights to zeros
+        pruned_mask = getattr(module, parameter_name + "_mask")
+        module.weight.data *= pruned_mask
+        
+        for module, _ in parameters_to_prune:
           prune.remove(module, 'weight')
+          print(list(module.named_parameters()))
+
     return model
-
-def evaluate_model_on_test_set(model, test_loader,criterion):
-    since = time.time()
-    model.eval()
-    device = set_device()
-
-    test_loss = 0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-      for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            test_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
-      print("Loss: %.3f | Acc: %.3f%% (%d/%d)"
-              % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-            
-    time_elapsed=time.time() - since
-    print("testing complete in {:.0f}m {:.0f}s".format(
-        time_elapsed //60, time_elapsed %60
-    ))
-
-def get_pruned_parameters_count(pruned_model):
-    params = 0
-    for param in pruned_model.parameters():
-        if param is not None:
-            params += torch.nonzero(param).size(0)
-    return params
-
+def get_total_parameters_count(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def print_model_parameters(model, with_values=False):
+    print(f"{'Param name':20} {'Shape':30} {'Type':15}")
+    print('-'*70)
+    for name, param in model.named_parameters():
+        print(f'{name:20} {str(param.shape):30} {str(param.dtype):15}')
+        if with_values:
+            print(param)
 def print_nonzeros(model):
     nonzero = total = 0
     for name, p in model.named_parameters():
@@ -155,333 +113,190 @@ def print_nonzeros(model):
         total += total_params
         print(f'{name:20} | nonzeros = {nz_count:7} / {total_params:7} ({100 * nz_count / total_params:6.2f}%) | total_pruned = {total_params - nz_count :7} | shape = {tensor.shape}')
     print(f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned)')
-
-def print_model_parameters(model, with_values=False):
-    print(f"{'Param name':20} {'Shape':30} {'Type':15}")
-    print('-'*70)
-    for name, param in model.named_parameters():
-        print(f'{name:20} {str(param.shape):30} {str(param.dtype):15}')
-        if with_values:
-            print(param)
-
-def col2im(mul,h_prime,w_prime,C):
-    """
-      Args:
-      mul: (h_prime*w_prime*w,F) matrix, each col should be reshaped to C*h_prime*w_prime when C>0, or h_prime*w_prime when C = 0
-      h_prime: reshaped filter height
-      w_prime: reshaped filter width
-      C: reshaped filter channel, if 0, reshape the filter to 2D, Otherwise reshape it to 3D
-    Returns:
-      if C == 0: (F,h_prime,w_prime) matrix
-      Otherwise: (F,C,h_prime,w_prime) matrix
-    """
-    F = mul.shape[1]
-    if(C == 1):
-        out = torch.zeros([F,h_prime,w_prime])
-        for i in range(F):
-            col = mul[:,i]
-            out[i,:,:] = torch.reshape(col,(h_prime,w_prime))
-    else:
-        out = torch.zeros([F,C,h_prime,w_prime])
-        for i in range(F):
-            col = mul[:,i]
-            out[i,:,:] = torch.reshape(col,(C,h_prime,w_prime))
-
-    return out
-
-def im2col(x,hh,ww,stride):
-
+ def get_pruned_parameters_count(pruned_model):
+    params = 0
+    for param in pruned_model.parameters():
+        if param is not None:
+            params += (param == 0).sum().item()  # Count the number of 0-valued parameters
+    return params
+ def col2im(mul, h_prime, w_prime, C):
     """
     Args:
-      x: image matrix to be translated into columns, (C,H,W)
-      hh: filter height
-      ww: filter width
-      stride: stride
+        mul: (h_prime * w_prime * w, F) matrix, each col
+             should be reshaped to C * h_prime * w_prime when C > 0, or
+             h_prime * w_prime when C = 0
+        h_prime: reshaped filter height
+        w_prime: reshaped filter width
+        C: reshaped filter channel, if 0, reshape the filter
+           to 2D, Otherwise reshape it to 3D
     Returns:
-      col: (new_h*new_w,hh*ww*C) matrix, each column is a cube that will convolve with a filter
-            new_h = (H-hh) // stride + 1, new_w = (W-ww) // stride + 1
+        if C == 0: (F, h_prime, w_prime) matrix
+        Otherwise: (F, C, h_prime, w_prime) matrix
+    """
+    F = mul.shape[1]
+    if C == 0:
+        out = torch.zeros([F, h_prime, w_prime])
+        for i in range(F):
+            col = mul[:, i]
+            out[i, :, :] = torch.reshape(col, (h_prime, w_prime))
+    else:
+        out = torch.zeros([F, C, h_prime, w_prime])
+        for i in range(F):
+            col = mul[:, i]
+            out[i, :, :] = torch.reshape(col, (C, h_prime, w_prime))
+
+    return out
+def im2col(x, hh, ww, stride):
+    """
+    Args:
+        x: image matrix to be translated into columns, (C,H,W)
+        hh: filter height
+        ww: filter width
+        stride: stride, a tuple of two values (stride_height, stride_width)
+    Returns:
+        col: (new_h*new_w,hh*ww*C) matrix, each column is a cube that will convolve with a filter
+        new_h = (H-hh) // stride[0] + 1, new_w = (W-ww) // stride[1] + 1
     """
 
-    c,h,w = x.shape
-    new_h = (h-hh) // stride + 1
-    new_w = (w-ww) // stride + 1
-    col = torch.zeros([new_h*new_w,c*hh*ww])
+    c, h, w = x.shape
+    stride_height, stride_width = stride
+    new_h = (h - hh) // stride[0] + 1
+    new_w = (w - ww) // stride[1] + 1
+
+    col = torch.zeros([new_h * new_w, c * hh * ww], dtype=x.dtype, device=x.device)
 
     for i in range(new_h):
-       for j in range(new_w):
-           patch = x[...,i*stride:i*stride+hh,j*stride:j*stride+ww]
-           col[i*new_w+j,:] = torch.reshape(patch,(-1,))
+        for j in range(new_w):
+            patch = x[..., (i * stride[0]):(i * stride[1] + hh), (j * stride[1]):(j * stride[1] + ww)]
+            col[i * new_w + j, :] = torch.reshape(patch, (-1,))
     return col
+import scipy.sparse as sp
 
-from numba import cuda
-import cupy as cp
-import numpy as np
-from cupy_backends.cuda.libs import  cusparse , cublas
-from numba import njit 
+def sparse_matmul_tensorcore(a, b):
+    a = a.cpu().detach().numpy()
+    b= b.cpu().detach().numpy()
+    # Convert sparse matrix A to CSR format
+    a_csr = sp.csr_matrix(a)
 
-import numba
-from numba import float32, int32#, float16
+    # Extract the CSR format data
+    indices = torch.tensor(a_csr.indices, dtype=torch.int32).cuda()
+    indptr = torch.tensor(a_csr.indptr, dtype=torch.int32).cuda()
+    values = torch.tensor(a_csr.data, dtype=torch.float16).cuda()
 
-TPB = 16
+    M, N = a.shape
+    N, K = b.shape
 
+    # Determine the block size for matrix multiplication
+    block_size = 16
 
-def fast_matmul(A, B):
-    @njit
-    def matmul(A, B):
-        # Define an array in the shared memory
-        # The size and type of the arrays must be known at compile time
-        A = cp. array(A)
-        B = cp.array(B)
-        TPB = 16
-        sA = cuda.shared.array(shape=(TPB, TPB), dtype=float32)
-        sB = cuda.shared.array(shape=(TPB, TPB), dtype=float32)
-        C = cp.zeros((A.shape[0], B.shape[1])).astype(cp.float32)
+    # Allocate memory for output matrix C
+    c = torch.zeros((M, K), dtype=torch.float16).cuda()
 
-        x, y = cuda.grid(2)
+    # Enable Tensor Cores for mixed-precision matrix multiplication
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.autocast_mode = 'TF32'
 
-        tx = cuda.threadIdx.x
-        ty = cuda.threadIdx.y
-        bpg = cuda.gridDim.x    # blocks per grid
+    # Loop over the blocks of matrices A and B
+    for m in range(0, M, block_size):
+        for k in range(0, K, block_size):
+            for n in range(0, N, block_size):
+                # Extract block of size 16x16 from A and B
+                a_block_indices = indices[indptr[m]:indptr[min(m+block_size, M)]]
+                a_block_values = values[indptr[m]:indptr[min(m+block_size, M)]]
+                a_block = torch.sparse_coo_tensor(a_block_indices, a_block_values,
+                                                  (min(m+block_size, M), N)).to_dense()
+                b_block = b[n:min(n+block_size, N), k:min(k+block_size, K)]
 
-        if x >= C.shape[0] and y >= C.shape[1]:
-            return
+                # Perform matrix multiplication using torch.mm() with Tensor Cores
+                c_block = torch.mm(a_block, b_block)
 
-        # Each thread computes one element in the result matrix.
-        # The dot product is chunked into dot products of TPB-long vectors.
-        tmp = 0.
-        for i in range(bpg):
-             # Preload data into shared memory
-             sA[tx, ty] = A[x, ty + i * TPB]
-             sB[tx, ty] = B[tx + i * TPB, y]
+                # Accumulate the results in output matrix C
+                c[m:min(m+block_size, M), k:min(k+block_size, K)] += c_block
 
-             # Wait until all threads finish preloading
-             cuda.syncthreads()
+    # Disable Tensor Cores
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.autocast_mode = 'FP32'
+    c = torch.tensor(c)
 
-             # Computes partial product on the shared memory
-             for j in range(TPB):
-                  tmp += sA[tx, j] * sB[j, ty]
-
-              # Wait until all threads finish computing
-             cuda.syncthreads()
-
-        C[x, y] = tmp
-        C = cp.asnumpy(C)
-        return C 
-
-    threadsperblock = (TPB, TPB)
-    blockspergrid = int(np.ceil(A.shape[0] / threadsperblock[0]))
-    blockspergrid = (blockspergrid, blockspergrid)
-    mull = matmul[blockspergrid, threadsperblock](A, B)
-    return mull
-
+    return c
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torch.nn.modules.utils import _pair
 class DeformableConv2d(nn.Module):
-  
-    def __init__(self, in_channel, out_channel, kernel_size=3, stride=1, padding=0, dilation = 1 ,bias=True):
-        super(DeformableConv2d, self).__init__()
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.in_channel = in_channel
-        self.out_channel = out_channel
-        self.stride = stride
-        self.padding = padding
-        self.bias = bias
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, dilation=1, bias=True,groups=1):
+        super(DeformableConv2d, self).__init__()  
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.pad_num = padding
-        self.conv_param = {'stride':self.stride , 'pad':self.pad_num}
-        self.weight = nn.Parameter(torch.Tensor(out_channel, in_channel,kernel_size, kernel_size),requires_grad=True)
-        self.conv = nn.Parameter(torch.Tensor(out_channel, in_channel,kernel_size, kernel_size),requires_grad=True)
-        nn.init.xavier_uniform_(self.conv, gain=nn.init.calculate_gain('relu'))
-        nn.init.kaiming_normal_(self.conv, mode='fan_out', nonlinearity='relu')
-        
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.conv_param = {'stride': self.stride , 'pad': self.pad_num}
+        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size, kernel_size), requires_grad=True)
+        nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain('relu'))
+        self._reset_parameters()  # Call the _reset_parameters function
+        self.groups = groups
+        self.bias = bias
+
+    def _reset_parameters(self):
+        """Reset the parameters of the convolutional layer."""
+        nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain('relu'))
 
     def conv_forward_naive(self, input: Tensor, weight: Tensor, bias: Tensor):
-        x= input
+        x = input
         out = None
         ww = self.kernel_size
         hh = self.kernel_size
         b = self.bias
-        weight= self.weight
+        weight = self.weight
         stride = self.conv_param['stride']
         pad_num = self.conv_param['pad']
         conv_param = self.conv_param
-        N,C,H,W = x.shape
-        F,C,HH,WW = weight.shape
-        H_prime = (H+2*pad_num-HH) // stride + 1
-        W_prime = (W+2*pad_num-WW) // stride + 1
-        out = torch.zeros([N,F,H_prime,W_prime])
-        #im2col
+        N, C, H, W = x.shape
+        F, C, HH, WW = weight.shape
+        H_prime = (H + 2 * pad_num - HH) // stride[0] + 1
+        W_prime = (W + 2 * pad_num - WW) // stride[1] + 1
+
+        out = torch.zeros([N, F, H_prime, W_prime])
+        # im2col
         for im_num in range(N):
-           im = x[im_num,:,:,:].to(device)
-           im_pad = torch.nn.functional.pad(im,(pad_num,pad_num,pad_num,pad_num),'constant',0).to(device)
-           im_col = im2col(im_pad,HH,WW,stride).to(device)
-           filter_col = torch.reshape(weight,(F,-1)).to(device)
-           mul = fast_matmul(im_col ,filter_col.T ).to(device)
-           #mul = torch.matmul(im_col , filter_col.T).to(device)
-           mull = torch.add(mul , b).to(device)
-           out[im_num,:,:,:] = col2im(mull,H_prime,W_prime,1).to(device)
+            im = x[im_num, :, :, :].to(device)
+            im_pad = torch.nn.functional.pad(im, (pad_num, pad_num, pad_num, pad_num), 'constant', 0).to(device)
+            im_col = im2col(im_pad, HH, WW, stride).to(device)
+            filter_col = torch.reshape(weight, (F, -1)).to(device)
+            mul = sparse_matmul_tensorcore(im_col, filter_col.T).to(device)
+            mull = torch.add(mul, b).to(device)
+            out[im_num, :, :, :] = col2im(mull, H_prime, W_prime, 1).to(device)
           
         return out.float()
-      
 
     def forward(self, input: Tensor):
-        return  self.conv_forward_naive(input, self.weight, self.bias).to(device)
-
-         
-        
-
-
-
-import torch
-import torch.nn as  nn
-import torch.nn.functional as F
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-    def __init__(self, in_channels, out_channels, i_downsample=None, stride=1):
-        super(Bottleneck, self).__init__()
-        convn = DeformableConv2d
-        self.conv1 = convn(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.batch_norm1 = nn.BatchNorm2d(out_channels)
-        
-        self.conv2 = convn(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
-        self.batch_norm2 = nn.BatchNorm2d(out_channels)
-        
-        self.conv3 = convn(out_channels, out_channels*self.expansion, kernel_size=1, stride=1, padding=0)
-        self.batch_norm3 = nn.BatchNorm2d(out_channels*self.expansion)
-        
-        self.i_downsample = i_downsample
-        self.stride = stride
-        self.relu = nn.ReLU()
-        
-    def forward(self, x):
-        identity = x.clone()
-        x = self.relu(self.batch_norm1(self.conv1(x)))
-        
-        x = self.relu(self.batch_norm2(self.conv2(x)))
-        
-        x = self.conv3(x)
-        x = self.batch_norm3(x)
-        
-        #downsample if needed
-        if self.i_downsample is not None:
-            identity = self.i_downsample(identity)
-        #add identity
-        x+=identity
-        x=self.relu(x)
-        
-        return x
-
-class Block(nn.Module):
-    expansion = 1
-    def __init__(self, in_channels, out_channels, i_downsample=None, stride=1):
-        super(Block, self).__init__()
-        convn = DeformableConv2d
-
-        self.conv1 = convn(in_channels, out_channels, kernel_size=3, padding=1, stride=stride, bias=False)
-        self.batch_norm1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = convn(out_channels, out_channels, kernel_size=3, padding=1, stride=stride, bias=False)
-        self.batch_norm2 = nn.BatchNorm2d(out_channels)
-
-        self.i_downsample = i_downsample
-        self.stride = stride
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-      identity = x.clone()
-
-      x = self.relu(self.batch_norm2(self.conv1(x)))
-      x = self.batch_norm2(self.conv2(x))
-
-      if self.i_downsample is not None:
-          identity = self.i_downsample(identity)
-      print(x.shape)
-      print(identity.shape)
-      x += identity
-      x = self.relu(x)
-      return x
+        if input.dim() == 4:
+            return self.conv_forward_naive(input, self.weight, self.bias).to(device)
+        elif input.dim() < 4:
+            # Reshape input to have 4 dimensions
+            while input.dim() < 4:
+                input = input.unsqueeze(0)
+            output = self.conv_forward_naive(input, self.weight, self.bias).to(device)
+            # Remove extra dimensions from output
+            while output.dim() > input.dim():
+                output = output.squeeze(0)
+            return output
 
 
-        
-        
-class ResNet(nn.Module):
-    def __init__(self, ResBlock, layer_list, num_classes, num_channels=3):#,deformable = False):
-        super(ResNet, self).__init__()
-        convn = DeformableConv2d# nn.Conv2d if deformable==False else DeformableConv2d
-        self.in_channels = 64
-        
-        self.conv1 = convn(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.batch_norm1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU()
-        self.max_pool = nn.MaxPool2d(kernel_size = 3, stride=2, padding=1)
-        
-        self.layer1 = self._make_layer(ResBlock, layer_list[0], planes=64)
-        self.layer2 = self._make_layer(ResBlock, layer_list[1], planes=128, stride=2)
-        self.layer3 = self._make_layer(ResBlock, layer_list[2], planes=256, stride=2)
-        self.layer4 = self._make_layer(ResBlock, layer_list[3], planes=512, stride=2)
-        
-        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
-        self.fc = nn.Linear(512*ResBlock.expansion, num_classes)
-        
-    def forward(self, x):
-        x = self.relu(self.batch_norm1(self.conv1(x)))
-        x = self.max_pool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        
-        x = self.avgpool(x)
-        x = x.reshape(x.shape[0], -1)
-        x = self.fc(x)
-        
-        return x
-        
-    def _make_layer(self, ResBlock, blocks, planes, stride=1):
-        convn = DeformableConv2d# nn.Conv2d if deformable==False else DeformableConv2d
-        ii_downsample = None
-        layers = []
-        
-        if stride != 1 or self.in_channels != planes*ResBlock.expansion:
-            ii_downsample = nn.Sequential(
-                convn(self.in_channels, planes*ResBlock.expansion, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(planes*ResBlock.expansion)
-            )
-            
-        layers.append(ResBlock(self.in_channels, planes, i_downsample=ii_downsample, stride=stride))
-        self.in_channels = planes*ResBlock.expansion
-        
-        for i in range(blocks-1):
-            layers.append(ResBlock(self.in_channels, planes))
-            
-        return nn.Sequential(*layers)
-
-        
-        
-def ResNet50(num_classes, channels=3):#,deformable = False):
-    return ResNet(Bottleneck, [3,4,6,3], num_classes, channels)
-    
-def ResNet101(num_classes, channels=3):
-    return ResNet(Bottleneck, [3,4,23,3], num_classes, channels)
-
-def ResNet152(num_classes, channels=3):
-    return ResNet(Bottleneck, [3,8,36,3], num_classes, channels)
-
-
-resnet_model = ResNet50(10).to(device)#models.resnet18()
-
-
-
-loss_fn = nn.CrossEntropyLoss()
-
-optimizer = optim.Adam(resnet_model.parameters(), lr=0.01)
-
-scaler = torch.cuda.amp.GradScaler()
-
-def train1(model, train_loader, criterion, optimizer, n_epochs,scaler):
-    since=time.time()
+    def _pair(self, val):
+        if isinstance(val, int):
+            return (val, val)
+        else:
+            return val
+def train(model, train_loader, criterion, optimizer, n_epochs, scaler):
+    since = time.time()
     device = set_device()
     model.train()
+    train_losses = []  # List to store the training losses for each epoch
+    train_accuracies = []  # List to store the training accuracies for each epoch
     for epoch in range(n_epochs):
         train_loss = 0
         correct = 0
@@ -491,8 +306,8 @@ def train1(model, train_loader, criterion, optimizer, n_epochs,scaler):
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast():
-               output = model(inputs)
-               loss = criterion(output, targets)
+                output = model(inputs)
+                loss = criterion(output, targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -502,35 +317,178 @@ def train1(model, train_loader, criterion, optimizer, n_epochs,scaler):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
+        epoch_loss = train_loss / (batch_idx + 1)
+        epoch_accuracy = 100. * correct / total
+        train_losses.append(epoch_loss)
+        train_accuracies.append(epoch_accuracy)
+
         print('\nEpoch: %d' % epoch, " Loss: %.3f | Acc: %.3f%% (%d/%d)"
-                % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
-    time_elapsed=time.time() - since
+              % (train_loss / (batch_idx + 1), 100. * correct / total, correct, total))
+    time_elapsed = time.time() - since
     print("training complete in {:.0f}m {:.0f}s".format(
-        time_elapsed //60, time_elapsed %60
+        time_elapsed // 60, time_elapsed % 60
     ))
+
+    # Plotting the loss and accuracy curves
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, n_epochs + 1), train_losses, color="r")
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, n_epochs + 1), train_accuracies, color="b")
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Training Accuracy')
+
+    plt.show()
+
     return model
 
 
+
+
+
+# Commented out IPython magic to ensure Python compatibility.
+def evaluate_model_on_test_set(model, test_loader,criterion):
+    since = time.time()
+    model.eval()
+    device = set_device()
+
+    test_loss = 0
+    correct = 0
+    total = 0
+    loss_list = []
+    accuracy_list = []
+    with torch.no_grad():
+      for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+             # Append loss and accuracy to lists for plotting
+            loss_list.append(loss.item())
+            accuracy_list.append(predicted.eq(targets).sum().item() / targets.size(0))
+
+    test_loss /= (batch_idx + 1)
+    test_accuracy = 100. * correct / total
+
+    print("Loss: %.3f | Acc: %.3f%% (%d/%d)"
+            % (test_loss, test_accuracy, correct, total))
+
+    time_elapsed = time.time() - since
+    print("Testing complete in {:.0f}m {:.0f}s".format(
+        time_elapsed // 60, time_elapsed % 60
+    ))
+
+    # Plot loss and accuracy
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(loss_list,color="r")
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Test Loss Over Time')
+    plt.subplot(1, 2, 2)
+    plt.plot(accuracy_list,color="b")
+    plt.xlabel('Iteration')
+    plt.ylabel('Accuracy')
+    plt.title('Test Accuracy Over Time')
+    plt.show()
+
+
+import torch
+import torch.nn as nn
+from torchvision.models import resnet50
+from torch.cuda.amp import autocast
+
+
+class DeformableResNet50(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(DeformableResNet50, self).__init__()
+        resnet = resnet50(pretrained=True)
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.deformable_conv = DeformableConv2d(2048, num_classes, kernel_size=1)
+
+    @autocast()
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.deformable_conv(x)
+
+        return x
+
+    @autocast
+    def forward_amp(self, x):
+        return self.forward(x)
+resnet_model =  DeformableResNet50().to(device)
+
+
+print(resnet_model)
+print_model_parameters(resnet_model)
+total_params_count = get_total_parameters_count(resnet_model)
+print("total_params_count : ",total_params_count)
+
+
+loss_fn = nn.CrossEntropyLoss()
+
+optimizer = optim.Adam(resnet_model.parameters(), lr=0.01)
+
+scaler = torch.cuda.amp.GradScaler()
+
 print("--- Initial training ---")
-Model=train1(resnet18_model, train_loader, loss_fn, optimizer, 50,scaler)
+Model=train(resnet_model, train_loader, loss_fn, optimizer, 50,scaler)
 evaluate_model_on_test_set(Model, test_loader,loss_fn)
-#print("--- Before pruning ---")
-#print_nonzeros(Model)
+total_params_count = get_total_parameters_count(Model)
+print("--- Before pruning ---")
+print("total_params_count : ",total_params_count)
+print_nonzeros(Model)
+print("pruned_parameters_count : ",get_pruned_parameters_count(Model))
 
 # Pruning
-Model_prune = prune_model(resnet18_model)
+Model_prune = prune_model(Model)
 evaluate_model_on_test_set(Model_prune, test_loader,loss_fn)
+total_params_count = get_total_parameters_count(Model_prune)
 print("--- After pruning ---")
+print("total_params_count : ",total_params_count)
 print_nonzeros(Model_prune)
+print("pruned_parameters_count : ",get_pruned_parameters_count(resnet_model))
+
 
 # Retrain
 print("--- Retraining ---")
 initial_optimizer_state_dict = optimizer.state_dict()
 optimizer.load_state_dict(initial_optimizer_state_dict) # Reset the optimizer
-Model=train1(Model_prune, train_loader, loss_fn, optimizer, 50,scaler)
-evaluate_model_on_test_set(Model, test_loader,loss_fn)
+Model2=train(Model_prune, train_loader, loss_fn, optimizer, 50,scaler)
+evaluate_model_on_test_set(Model2, test_loader,loss_fn)
+total_params_count = get_total_parameters_count(Model2)
 print("--- After Retraining ---")
+print("total_params_count : ",total_params_count)
 print_nonzeros(Model)
-
-
-
+print("pruned_parameters_count : ",get_pruned_parameters_count(Model2))
